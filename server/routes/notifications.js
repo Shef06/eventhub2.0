@@ -1,72 +1,100 @@
 import express from 'express';
 import { ObjectId } from 'mongodb';
 import auth from '../middleware/auth.js';
-import { getTimestamps, updateTimestamp } from '../utils/db.js';
+import { getTimestamps, updateTimestamp, handleApiError } from '../utils/db.js';
 
 const router = express.Router();
 
-// Get user notifications
+// Get user notifications with pagination and filters
 router.get('/', auth, async (req, res) => {
   try {
     const db = req.app.locals.db;
-    const notifications = await db.collection('Notification')
-      .find({ user: new ObjectId(req.userId) })
-      .sort({ createdAt: -1 })
-      .toArray();
-      
-    res.json(notifications);
+    const { page = 1, limit = 10, type, read } = req.query;
+    
+    let query = { users: req.userId };
+    
+    if (type) {
+      query.type = type;
+    }
+    
+    if (read !== undefined) {
+      query.read = read === 'true';
+    }
+    
+    const skip = (page - 1) * limit;
+    
+    const [notifications, total] = await Promise.all([
+      db.collection('Notification')
+        .find(query)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .toArray(),
+      db.collection('Notification').countDocuments(query)
+    ]);
+    
+    res.json({
+      notifications,
+      pagination: {
+        total,
+        pages: Math.ceil(total / limit),
+        currentPage: parseInt(page),
+        hasMore: skip + notifications.length < total
+      }
+    });
   } catch (error) {
-    console.error('Error fetching notifications:', error);
-    res.status(500).json({ message: "Error fetching notifications" });
+    handleApiError(error, res);
   }
 });
 
-// Mark notification as read
-router.patch('/:id/read', auth, async (req, res) => {
+// Mark multiple notifications as read
+router.patch('/mark-read', auth, async (req, res) => {
   try {
     const db = req.app.locals.db;
-    const notification = await db.collection('Notification').findOneAndUpdate(
+    const { notificationIds } = req.body;
+    
+    if (!Array.isArray(notificationIds) || notificationIds.length === 0) {
+      return res.status(400).json({ message: "Invalid notification IDs" });
+    }
+    
+    const result = await db.collection('Notification').updateMany(
       { 
-        _id: new ObjectId(req.params.id),
-        user: new ObjectId(req.userId)
+        _id: { $in: notificationIds.map(id => new ObjectId(id)) },
+        users: req.userId
       },
       { 
         $set: { 
           read: true,
           ...updateTimestamp()
         } 
-      },
-      { returnDocument: 'after' }
+      }
     );
 
-    if (!notification.value) {
-      return res.status(404).json({ message: "Notification not found" });
-    }
-
-    res.json(notification.value);
+    res.json({ 
+      message: "Notifications marked as read",
+      modifiedCount: result.modifiedCount
+    });
   } catch (error) {
-    console.error('Error updating notification:', error);
-    res.status(500).json({ message: "Error updating notification" });
+    handleApiError(error, res);
   }
 });
 
-// Create notification
-router.post('/', auth, async (req, res) => {
+// Delete notification
+router.delete('/:id', auth, async (req, res) => {
   try {
     const db = req.app.locals.db;
-    const notification = {
-      user: new ObjectId(req.userId),
-      message: req.body.message,
-      type: req.body.type,
-      read: false,
-      ...getTimestamps()
-    };
+    const result = await db.collection('Notification').deleteOne({
+      _id: new ObjectId(req.params.id),
+      users: req.userId
+    });
 
-    const result = await db.collection('Notification').insertOne(notification);
-    res.status(201).json({ ...notification, _id: result.insertedId });
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ message: "Notification not found" });
+    }
+
+    res.json({ message: "Notification deleted successfully" });
   } catch (error) {
-    console.error('Error creating notification:', error);
-    res.status(500).json({ message: "Error creating notification" });
+    handleApiError(error, res);
   }
 });
 

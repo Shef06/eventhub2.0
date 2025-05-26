@@ -1,37 +1,40 @@
 import express from 'express';
-import auth from '../middleware/auth.js';
-import { getNextSequence, getTimestamps, updateTimestamp } from '../utils/db.js';
+import auth, { adminAuth } from '../middleware/auth.js';
+import { 
+  getNextSequence, 
+  getTimestamps, 
+  updateTimestamp, 
+  formatEventData,
+  validateEventData,
+  handleApiError 
+} from '../utils/db.js';
 
 const router = express.Router();
 
-// Get all events with filters
+// Get all events with filters and pagination
 router.get('/', async (req, res) => {
   try {
     const db = req.app.locals.db;
-    const { search, category, city, date } = req.query;
+    const { search, category, city, date, page = 1, limit = 12 } = req.query;
     
     let query = { isPublic: true };
     
-    // Filtro per ricerca testuale
     if (search) {
       query.$or = [
         { title: { $regex: search, $options: 'i' } },
         { location: { $regex: search, $options: 'i' } },
-        { organizer: { $regex: search, $options: 'i' } }
+        { description: { $regex: search, $options: 'i' } }
       ];
     }
     
-    // Filtro per categoria
     if (category) {
       query.category = category;
     }
     
-    // Filtro per città
     if (city) {
       query.location = { $regex: `^${city}`, $options: 'i' };
     }
     
-    // Filtro per data
     if (date) {
       const startDate = new Date(date);
       const endDate = new Date(date);
@@ -43,42 +46,46 @@ router.get('/', async (req, res) => {
       };
     }
     
-    const events = await db.collection('Event')
-      .find(query)
-      .sort({ date: 1 })
-      .toArray();
+    const skip = (page - 1) * limit;
     
-    // Populate creator information
+    const [events, total] = await Promise.all([
+      db.collection('Event')
+        .find(query)
+        .sort({ date: 1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .toArray(),
+      db.collection('Event').countDocuments(query)
+    ]);
+    
     const populatedEvents = await Promise.all(events.map(async (event) => {
       const creator = await db.collection('User').findOne(
         { _id: event.creator },
         { projection: { name: 1 } }
       );
-      return { 
-        ...event, 
-        creator,
-        id: event._id.toString(),
-        titolo: event.title,
-        data: event.date.toISOString(),
-        luogo: event.location,
-        categoria: event.category,
-        immagine: event.image || 'https://images.pexels.com/photos/1105666/pexels-photo-1105666.jpeg',
-        partecipanti: event.participants?.length || 0,
-        organizzatore: creator?.name || 'Organizzatore'
-      };
+      return formatEventData(event, creator);
     }));
     
-    res.json(populatedEvents);
+    res.json({
+      events: populatedEvents,
+      pagination: {
+        total,
+        pages: Math.ceil(total / limit),
+        currentPage: parseInt(page),
+        hasMore: skip + events.length < total
+      }
+    });
   } catch (error) {
-    console.error('Error fetching events:', error);
-    res.status(500).json({ message: "Error fetching events" });
+    handleApiError(error, res);
   }
 });
 
-// Create event
+// Create event with image upload support
 router.post('/', auth, async (req, res) => {
   try {
     const db = req.app.locals.db;
+    validateEventData(req.body);
+    
     const eventId = await getNextSequence(db, 'Event');
     
     const event = {
@@ -86,19 +93,34 @@ router.post('/', auth, async (req, res) => {
       ...req.body,
       creator: req.userId,
       participants: [],
+      isPublic: req.body.isPublic ?? true,
       ...getTimestamps()
     };
 
     await db.collection('Event').insertOne(event);
+    
+    // Update user's created events
     await db.collection('User').updateOne(
       { _id: req.userId },
       { $push: { createdEvents: eventId } }
     );
 
-    res.status(201).json(event);
+    // Create notification for followers
+    const creator = await db.collection('User').findOne({ _id: req.userId });
+    if (creator.followers?.length > 0) {
+      const notification = {
+        type: 'new_event',
+        message: `${creator.name} ha creato un nuovo evento: ${event.title}`,
+        users: creator.followers,
+        eventId: eventId,
+        ...getTimestamps()
+      };
+      await db.collection('Notification').insertOne(notification);
+    }
+
+    res.status(201).json(formatEventData(event, creator));
   } catch (error) {
-    console.error('Error creating event:', error);
-    res.status(500).json({ message: "Error creating event" });
+    handleApiError(error, res);
   }
 });
 
